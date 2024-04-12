@@ -19,6 +19,11 @@ import (
 	"testing"
 	"time"
 
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
+	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
+	"k8s.io/klog/v2/ktesting"
+
 	"github.com/google/go-cmp/cmp"
 	"github.com/google/go-cmp/cmp/cmpopts"
 	"github.com/stretchr/testify/assert"
@@ -1218,4 +1223,117 @@ func makeJob(args *makeJobArgs) *testutils.JobWrapper {
 		PodLabels(labels).
 		PodAnnotations(annotations)
 	return jobWrapper
+}
+
+func TestCreateHeadlessSvcIfNecessary(t *testing.T) {
+	var (
+		jobSetName = "test-jobset"
+		ns         = "default"
+	)
+
+	tests := []struct {
+		name                           string
+		jobSet                         *jobset.JobSet
+		existingService                *corev1.Service
+		expectServiceCreate            bool
+		expectServiceName              string
+		expectPublishNotReadyAddresses bool
+	}{
+		{
+			name:   "headless service should not be created",
+			jobSet: testutils.MakeJobSet(jobSetName, ns).EnableDNSHostnames(false).Obj(),
+		},
+		{
+			name:   "headless service exists and should not be created",
+			jobSet: testutils.MakeJobSet(jobSetName, ns).EnableDNSHostnames(true).Obj(),
+			existingService: &corev1.Service{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-jobset",
+					Namespace: ns,
+				},
+			},
+		},
+		{
+			name:                "service does not exist and should be created, subdomain not set",
+			jobSet:              testutils.MakeJobSet(jobSetName, ns).EnableDNSHostnames(true).Obj(),
+			expectServiceCreate: true,
+			expectServiceName:   "test-jobset",
+		},
+		{
+			name:                "service does not exist and should be created, subdomain set",
+			jobSet:              testutils.MakeJobSet(jobSetName, ns).EnableDNSHostnames(true).NetworkSubdomain("test-subdomain").Obj(),
+			expectServiceCreate: true,
+			expectServiceName:   "test-subdomain",
+		},
+		{
+			name:                           "service does exist and should be created, publishNotReadyAddresses is false",
+			jobSet:                         testutils.MakeJobSet(jobSetName, ns).EnableDNSHostnames(true).PublishNotReadyAddresses(false).Obj(),
+			expectServiceCreate:            true,
+			expectServiceName:              "test-jobset",
+			expectPublishNotReadyAddresses: false,
+		},
+		{
+			name:                           "service does not exist and should be created, publishNotReadyAddresses is true",
+			jobSet:                         testutils.MakeJobSet(jobSetName, ns).EnableDNSHostnames(true).PublishNotReadyAddresses(true).Obj(),
+			expectServiceCreate:            true,
+			expectServiceName:              "test-jobset",
+			expectPublishNotReadyAddresses: true,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			_, ctx := ktesting.NewTestContext(t)
+			scheme := runtime.NewScheme()
+			utilruntime.Must(jobset.AddToScheme(scheme))
+			utilruntime.Must(corev1.AddToScheme(scheme))
+			utilruntime.Must(batchv1.AddToScheme(scheme))
+			fakeClientBuilder := fake.NewClientBuilder().WithScheme(scheme)
+			if tc.existingService != nil {
+				fakeClientBuilder.WithObjects(tc.existingService)
+			}
+			fakeClient := fakeClientBuilder.Build()
+
+			// Create a JobSetReconciler instance with the fake client
+			reconciler := &JobSetReconciler{
+				Client: fakeClient,
+				Scheme: scheme,
+			}
+
+			// Execute the function under test
+			gotErr := reconciler.createHeadlessSvcIfNecessary(ctx, tc.jobSet)
+			if gotErr != nil {
+				t.Errorf("createHeadlessSvcIfNecessary() error = %v", gotErr)
+			}
+			if tc.expectServiceCreate {
+				svc := &corev1.Service{}
+				gotErr = fakeClient.Get(ctx, types.NamespacedName{Name: tc.expectServiceName, Namespace: ns}, svc)
+				if gotErr != nil {
+					t.Errorf("expected service to be created but got an error: %v", gotErr)
+				}
+				if svc.OwnerReferences == nil || len(svc.OwnerReferences) == 0 {
+					t.Error("expected service to have owner reference set")
+				}
+				if svc.OwnerReferences[0].Name != tc.jobSet.Name {
+					t.Errorf("expected owner reference to be %q, got %q", tc.jobSet.Name, svc.OwnerReferences[0].Name)
+				}
+				if svc.OwnerReferences[0].Kind != "JobSet" {
+					t.Errorf("expected owner reference kind to be JobSet, got %q", svc.OwnerReferences[0].Kind)
+				}
+				if svc.Spec.ClusterIP != corev1.ClusterIPNone {
+					t.Errorf("expected service to have ClusterIPNone, got %s", svc.Spec.ClusterIP)
+				}
+				selector, ok := svc.Spec.Selector[jobset.JobSetNameKey]
+				if !ok {
+					t.Errorf("expected service selector to contain %q key", jobset.JobSetNameKey)
+				}
+				if selector != tc.jobSet.Name {
+					t.Errorf("expected service selector to be %q, got %q", tc.jobSet.Name, selector)
+				}
+				if svc.Spec.PublishNotReadyAddresses != tc.expectPublishNotReadyAddresses {
+					t.Errorf("expected PublishNotReadyAddresses to be %t, got %t", tc.expectPublishNotReadyAddresses, svc.Spec.PublishNotReadyAddresses)
+				}
+			}
+		})
+	}
 }

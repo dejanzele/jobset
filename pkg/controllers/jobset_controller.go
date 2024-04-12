@@ -566,6 +566,7 @@ func (r *JobSetReconciler) createHeadlessSvcIfNecessary(ctx context.Context, js 
 				Selector: map[string]string{
 					jobset.JobSetNameKey: js.Name,
 				},
+				PublishNotReadyAddresses: publishNotReadyAddressesEnabled(js),
 			},
 		}
 
@@ -897,6 +898,10 @@ func jobSetFinished(js *jobset.JobSet) bool {
 
 func dnsHostnamesEnabled(js *jobset.JobSet) bool {
 	return js.Spec.Network.EnableDNSHostnames != nil && *js.Spec.Network.EnableDNSHostnames
+}
+
+func publishNotReadyAddressesEnabled(js *jobset.JobSet) bool {
+	return js.Spec.Network.PublishNotReadyAddresses != nil && *js.Spec.Network.PublishNotReadyAddresses
 }
 
 func jobSetSuspended(js *jobset.JobSet) bool {
